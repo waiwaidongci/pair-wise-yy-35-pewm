@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import (HOLD_ACTIVE, ID_PREFIX, STATES, TERMINAL_STATES)
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        self._ensure_column("items", "retention_until", "TEXT")
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -38,7 +39,8 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    retention_until TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
                     ON items(external_ref) WHERE external_ref IS NOT NULL;
@@ -54,6 +56,25 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS legal_holds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    case_no TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    custodian TEXT NOT NULL,
+                    hold_from TEXT NOT NULL,
+                    hold_to TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT '{HOLD_ACTIVE}'
+                        CHECK(status IN ('{HOLD_ACTIVE}','released')),
+                    note TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    released_at TEXT,
+                    released_by TEXT,
+                    UNIQUE(item_id, case_no)
+                );
+                CREATE INDEX IF NOT EXISTS ix_legal_holds_item
+                    ON legal_holds(item_id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,6 +87,15 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        """对已存在的旧库做幂等加列；新库由CREATE TABLE直接创建。"""
+        with self.conn:
+            cols = {row["name"] for row in self.conn.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+            if cols and column not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -108,13 +138,15 @@ class Repository:
         return [self._item(row) for row in rows]
 
     def transition_item(self, item_id: int, target: str, expected_version: int,
-                        actor: str) -> Dict[str, Any]:
+                        actor: str, retention_until: Optional[str] = None
+                        ) -> Dict[str, Any]:
         now = utc_now()
         with self._lock, self.conn:
             cur = self.conn.execute(
-                """UPDATE items SET status=?, version=version+1, updated_at=?
+                """UPDATE items SET status=?, version=version+1, updated_at=?,
+                       retention_until=COALESCE(?, retention_until)
                    WHERE id=? AND version=?""",
-                (target, now, item_id, expected_version),
+                (target, now, retention_until, item_id, expected_version),
             )
             if cur.rowcount == 0:
                 exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
@@ -209,6 +241,110 @@ class Repository:
                 return False
             previous = row["entry_hash"]
         return True
+
+    def create_legal_hold(self, item_id: int, case_no: str, reason: str,
+                         custodian: str, hold_from: str, hold_to: str,
+                         note: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO legal_holds(item_id, case_no, reason, custodian,
+                       hold_from, hold_to, status, note, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (item_id, case_no, reason, custodian, hold_from, hold_to,
+                     HOLD_ACTIVE, note, actor, now),
+                )
+                hold_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("该案号的保全单已存在") from exc
+        return self.get_legal_hold(hold_id)
+
+    def get_legal_hold(self, hold_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("保全单不存在")
+        return dict(row)
+
+    def list_legal_holds(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM legal_holds WHERE item_id=? ORDER BY id",
+                (item_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def release_legal_hold(self, hold_id: int, actor: str,
+                           note: Optional[str] = None) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE legal_holds SET status='released', released_at=?,
+                       released_by=?,
+                       note=CASE WHEN ? IS NOT NULL THEN ? ELSE note END
+                   WHERE id=? AND status=?""",
+                (now, actor, note, note, hold_id, HOLD_ACTIVE),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM legal_holds WHERE id=?", (hold_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("保全单不存在")
+                raise ConflictError("保全单已解除")
+        return self.get_legal_hold(hold_id)
+
+    def active_hold_count(self, item_id: int, now: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) AS n FROM legal_holds
+                   WHERE item_id=? AND status=?
+                     AND hold_from<=? AND hold_to>?""",
+                (item_id, HOLD_ACTIVE, now, now)).fetchone()
+        return int(row["n"])
+
+    def cleanup_candidates(self, now: str) -> List[Dict[str, Any]]:
+        """已结案、保留截止日已过的事件；是否真删由重查阶段决定。"""
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
+        with self._lock:
+            rows = self.conn.execute(
+                f"""SELECT * FROM items
+                    WHERE status IN ({placeholders})
+                      AND retention_until IS NOT NULL AND retention_until<=?
+                    ORDER BY id""",
+                (*TERMINAL_STATES, now)).fetchall()
+        return [self._item(row) for row in rows]
+
+    def delete_item_guarded(self, item_id: int, expected_version: int,
+                            expected_retention_until: str, now: str) -> bool:
+        """清理执行前重查：版本、截止日与有效保全任一不满足则不删除。
+
+        整个判定与删除在同一事务内完成，避免检查后又有保全单写入。
+        返回True表示已删除，False表示状态已变动，应退回重算。
+        """
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT version, retention_until FROM items WHERE id=?",
+                (item_id,)).fetchone()
+            if row is None:
+                return False
+            if int(row["version"]) != expected_version:
+                return False
+            if row["retention_until"] != expected_retention_until:
+                return False
+            if expected_retention_until > now:
+                return False
+            blocked = self.conn.execute(
+                """SELECT 1 FROM legal_holds
+                   WHERE item_id=? AND status=? AND hold_from<=? AND hold_to>?
+                   LIMIT 1""",
+                (item_id, HOLD_ACTIVE, now, now)).fetchone()
+            if blocked is not None:
+                return False
+            self.conn.execute("DELETE FROM items WHERE id=?", (item_id,))
+            return True
 
     def close(self) -> None:
         with self._lock:

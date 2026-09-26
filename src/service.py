@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .audit import utc_now
+from .domain import (ConflictError, NotFoundError, ensure_role,
+                     normalize_severity, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CLEANUP_ROLES, CREATE_ROLES, ENTITY,
+                    HOLD_ROLES, HOLD_VIEW_ROLES, RECORD_ROLES, TERMINAL_STATES,
+                    TITLE, VIEW_ROLES, cleanup_decision, completion_blockers,
+                    escalation_required, priority_score,
+                    response_deadline_hours, retention_until,
+                    role_for_transition, ts_normalize, validate_hold_window,
                     validate_transition)
 
 
@@ -65,11 +70,16 @@ class Service:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
-        updated = self.repository.transition_item(item_id, target, expected_version, actor)
+        # 结案时按严重程度生成保留截止日；非结案流转不改已有值
+        retention = None
+        if target in TERMINAL_STATES:
+            retention = retention_until(item["severity"], utc_now()).isoformat()
+        updated = self.repository.transition_item(
+            item_id, target, expected_version, actor, retention)
         self.repository.append_audit("transition", ENTITY, item_id, actor, {
             "from": item["status"], "to": target,
+            "retention_until": retention,
             "escalation_required": escalation_required(
                 item["severity"], item["quantity"], item["threshold"]),
         })
@@ -90,6 +100,79 @@ class Service:
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
+
+    def place_hold(self, item_id: int, payload: Dict[str, Any],
+                   actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, HOLD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        case_no = require_text(payload.get("case_no"), "case_no", 100)
+        reason = require_text(payload.get("reason"), "reason")
+        custodian = require_text(payload.get("custodian"), "custodian", 100)
+        hold_from, hold_to = validate_hold_window(
+            payload.get("hold_from"), payload.get("hold_to"))
+        note = payload.get("note")
+        if note is not None:
+            note = require_text(note, "note", 2000)
+        hold = self.repository.create_legal_hold(
+            item_id, case_no, reason, custodian, hold_from, hold_to, note, actor)
+        self.repository.append_audit("legal_hold_placed", ENTITY, item_id, actor, {
+            "hold_id": hold["id"], "case_no": case_no, "custodian": custodian,
+            "hold_from": hold_from, "hold_to": hold_to, "reason": reason,
+        })
+        return hold
+
+    def release_hold(self, item_id: int, hold_id: int, payload: Dict[str, Any],
+                     actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, HOLD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        self.repository.get_item(item_id)
+        hold = self.repository.get_legal_hold(hold_id)
+        if hold["item_id"] != item_id:
+            raise NotFoundError("保全单不存在")
+        note = (payload or {}).get("note")
+        if note is not None:
+            note = require_text(note, "note", 2000)
+        released = self.repository.release_legal_hold(hold_id, actor, note)
+        self.repository.append_audit("legal_hold_released", ENTITY, item_id, actor, {
+            "hold_id": hold_id, "case_no": hold["case_no"],
+        })
+        return released
+
+    def list_holds(self, item_id: int, role: str) -> list:
+        ensure_role(role, HOLD_VIEW_ROLES)
+        return self.repository.list_legal_holds(item_id)
+
+    def cleanup_expired(self, actor: str, role: str,
+                        now: Optional[str] = None) -> Dict[str, Any]:
+        """例行清理入口：先按规则筛选，执行前对每条重查截止日与保全状态。
+
+        重查时若版本/截止日/保全发生变动则本次跳过（changed），退回下轮重算。
+        """
+        ensure_role(role, CLEANUP_ROLES)
+        actor = require_text(actor, "actor", 100)
+        moment = utc_now() if now is None else ts_normalize(now, "now")
+        deleted, skipped = [], []
+        for item in self.repository.cleanup_candidates(moment):
+            holds = self.repository.list_legal_holds(item["id"])
+            allowed, reason = cleanup_decision(item, holds, moment)
+            if not allowed:
+                skipped.append({"item_id": item["id"], "reason": reason})
+                continue
+            done = self.repository.delete_item_guarded(
+                item["id"], item["version"], item["retention_until"], moment)
+            if not done:
+                # 截止日、版本或保全在筛选后变动，退回重算
+                skipped.append({"item_id": item["id"], "reason": "changed"})
+                continue
+            self.repository.append_audit("purged", ENTITY, item["id"], actor, {
+                "severity": item["severity"],
+                "retention_until": item["retention_until"],
+            })
+            deleted.append(item["id"])
+        self.repository.append_audit("cleanup_run", ENTITY, 0, actor, {
+            "now": moment, "deleted": deleted, "skipped": skipped,
+        })
+        return {"now": moment, "deleted": deleted, "skipped": skipped}
 
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:

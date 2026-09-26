@@ -98,6 +98,14 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/cleanup":
+                    actor, role = self._identity()
+                    self._json(200, service.cleanup_expired(actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/holds"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"holds": service.list_holds(item_id, role)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,6 +118,18 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/cleanup":
+                    self._json(200, service.cleanup_expired(actor, role))
+                elif (path.startswith("/api/items/")
+                      and path.endswith("/holds")):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.place_hold(item_id, body, actor, role))
+                elif (path.startswith("/api/items/") and "/holds/" in path
+                      and path.endswith("/release")):
+                    parts = path.split("/")
+                    item_id, hold_id = int(parts[3]), int(parts[5])
+                    self._json(200, service.release_hold(
+                        item_id, hold_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
