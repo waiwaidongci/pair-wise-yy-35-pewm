@@ -89,6 +89,11 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/holds"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"holds": service.list_holds(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -113,6 +118,14 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/holds"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.place_hold(item_id, body, actor, role))
+                elif path.startswith("/api/holds/") and path.endswith("/release"):
+                    hold_id = int(path.split("/")[3])
+                    self._json(200, service.release_hold(hold_id, actor, role))
+                elif path == "/api/purge":
+                    self._json(200, service.purge_expired(actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")

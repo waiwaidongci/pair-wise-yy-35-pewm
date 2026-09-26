@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .audit import utc_now
+from .domain import (ValidationError, ensure_role, normalize_severity,
+                     require_number, require_text, require_timestamp)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, HOLD_ROLES, PURGE_ROLES,
+                    RECORD_ROLES, TERMINAL_STATES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, hold_effective,
+                    priority_score, response_deadline_hours, retention_deadline,
+                    role_for_transition, validate_transition)
 
 
 class Service:
@@ -67,13 +70,66 @@ class Service:
         if blockers:
             from .domain import ConflictError
             raise ConflictError("；".join(blockers))
-        updated = self.repository.transition_item(item_id, target, expected_version, actor)
-        self.repository.append_audit("transition", ENTITY, item_id, actor, {
+        retention_until = None
+        if target in TERMINAL_STATES:
+            retention_until = retention_deadline(item["severity"], utc_now())
+        updated = self.repository.transition_item(item_id, target, expected_version,
+                                                  actor, retention_until)
+        detail = {
             "from": item["status"], "to": target,
             "escalation_required": escalation_required(
                 item["severity"], item["quantity"], item["threshold"]),
-        })
+        }
+        if retention_until is not None:
+            detail["retention_until"] = retention_until
+        self.repository.append_audit("transition", ENTITY, item_id, actor, detail)
         return self.enrich(updated)
+
+    def place_hold(self, item_id: int, payload: Dict[str, Any], actor: str,
+                   role: str) -> Dict[str, Any]:
+        ensure_role(role, HOLD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        case_no = require_text(payload.get("case_no"), "case_no", 100)
+        reason = require_text(payload.get("reason"), "reason")
+        custodian = require_text(payload.get("custodian"), "custodian", 100)
+        start_at = require_timestamp(payload.get("start_at"), "start_at")
+        end_at = require_timestamp(payload.get("end_at"), "end_at")
+        if end_at <= start_at:
+            raise ValidationError("end_at必须晚于start_at")
+        hold = self.repository.create_hold(item_id, case_no, reason, custodian,
+                                           start_at, end_at, actor)
+        self.repository.append_audit("hold_place", ENTITY, item_id, actor, {
+            "hold_id": hold["id"], "case_no": case_no, "custodian": custodian,
+            "start_at": start_at, "end_at": end_at,
+        })
+        return hold
+
+    def release_hold(self, hold_id: int, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, HOLD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        hold = self.repository.release_hold(hold_id, actor)
+        self.repository.append_audit("hold_release", ENTITY, hold["item_id"], actor, {
+            "hold_id": hold["id"], "case_no": hold["case_no"],
+        })
+        return hold
+
+    def list_holds(self, item_id: int, role: str) -> list:
+        self._view(role)
+        now = utc_now()
+        holds = self.repository.list_holds(item_id)
+        for hold in holds:
+            hold["effective"] = hold_effective(hold, now)
+        return holds
+
+    def purge_expired(self, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, PURGE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        now = utc_now()
+        candidates = self.repository.purge_candidates(now)
+        if not candidates:
+            return {"purged": [], "count": 0}
+        purged = self.repository.purge_batch(candidates, now, actor)
+        return {"purged": purged, "count": len(purged)}
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
